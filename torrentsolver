@@ -1,0 +1,895 @@
+#!/usr/bin/python
+
+# ---------------------------------------------------------------------------
+#
+# Copyright (c) 2010 David Hanney
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation
+# files (the "Software"), to deal in the Software without
+# restriction, including without limitation the rights to use,
+# copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following
+# conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+# ---------------------------------------------------------------------------
+
+# for py2.5:
+from __future__ import division
+from __future__ import with_statement
+
+# ---------------------------------------------------------------------------
+
+import copy
+import os.path
+import hashlib
+import sys
+import re
+import errno
+
+import bencode
+import recursive_lister
+import dlib
+import args as args_module
+from logger import *
+
+# ---------------------------------------------------------------------------
+
+bencoder = bencode.Coder()
+
+
+# ---------------------------------------------------------------------------
+#
+# Classes
+#
+# ---------------------------------------------------------------------------
+
+class Interval:
+	def __init__(self, torrent_file, start, length):
+		self.torrent_file = torrent_file
+		self.start = start
+		self.length = length
+
+	def __str__(self):
+		return multirepr(self.torrent_file, self.start, self.length)
+
+	def call(self, function):
+		try:
+			with open(self.torrent_file.get_fullpath(), 'r') as file:
+				dlib.read_and_call(file, self.start, self.length, function)
+			return True
+		except IOError:
+			return False
+
+	def __str__(self):
+		return "'{0}' offset {1} length {2}".format(self.torrent_file.get_fullpath(), self.start, self.length)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+class TorrentFile:
+	def __init__(self, fullpath, length):
+		self._fullpath = fullpath
+		self._length = length
+
+	def get_fullpath(self):
+		return self._fullpath
+
+	def set_fullpath(self, fullpath):
+		self._fullpath = fullpath
+
+	def get_length(self):
+		return self._length
+
+	def __str__(self):
+		return "TF:"+self._fullpath
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+class CannotSolveTorrentException(Exception):
+	def __init__(*a):
+		Exception.__init__(*a)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+class CheckTorrentResult(object):
+	OK = 0
+	INACCESSIBLE = 1
+	BAD_CHECKSUM = 2
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+class PieceSolver(object):
+	# interval_solvers
+	# current
+	# count
+
+	def __init__(self, count, interval_solvers):
+		self.interval_solvers = interval_solvers
+		self.count = count
+		self.current = 0
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+class IntervalSolver(object):
+	# options
+	# option_count
+	# next
+	# torrent_file
+
+	def __init__(self):
+		pass
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+STYLE_COMMON = 2
+STYLE_IMPROVED = 3
+STYLE_MORE_IMPROVED = 4
+
+class Torrent(LoggerConnectable):
+	# ---------------------------------------------------------------------------
+	#
+	# LOCATING FILES
+	#
+
+	def is_multifile(self):
+		return 'files' in self.info
+
+	def get_name(self):
+		return self.info['name']		
+
+	def _get_basepath(self):
+		s = self.saveas_style
+		if s==STYLE_IMPROVED:
+			return os.path.splitext(self.torrent_fullpath)[0]
+		elif s==STYLE_COMMON:
+			a = os.path.dirname(self.torrent_fullpath)
+			if self.is_multifile(): a = os.path.join(a, self.get_name())
+			return a
+		raise Exception(dlib.multistr('Unsupported saveas_style:', s))
+
+	def get_torrent_folder(self):
+		assert self.saveas_style==STYLE_IMPROVED
+		return self._get_basepath()
+
+	def _torrent_files(self):
+		myfiles = []
+		if self.is_multifile():
+			for file in self.info['files']:
+				b = os.path.join(self._get_basepath(), *file['path'])
+				myfiles.append( TorrentFile(b, file['length']) )
+		else:
+			b = os.path.join(self._get_basepath(), self.get_name())
+			myfiles.append( TorrentFile(b, self.info['length']) )
+		return myfiles
+
+	# ---------------------------------------------------------------------------
+	#
+	# INTERVALS
+	#
+
+	def _intervals(self, start, end):
+		answer = []
+		length = end-start
+		for file in self.myfiles:
+			fl = file.get_length()
+			if start>fl:
+				#print 'skip', start, fl
+				start -= fl
+			else:
+				d = min(fl-start, length)
+				#print 'do', d
+				if d:
+					answer.append( Interval(file, start, d) )
+					length -= d
+				start = 0
+		return answer
+
+	def _real_piece_intervals(self, piece):
+		start_of_piece = piece*self.piece_length
+		end_of_piece = start_of_piece+self.piece_length
+		return self._intervals(start_of_piece, end_of_piece)
+
+	def _piece_intervals(self, piece):
+		if not self._piece_intervals_cache:
+			self._piece_intervals_cache = [ self._real_piece_intervals(p) for p in xrange(self.piece_count) ]
+		return self._piece_intervals_cache[piece]
+
+	# ---------------------------------------------------------------------------
+	#
+	# SOLUTION CACHE
+	#
+
+	def _solution_cache_path(self):
+		return os.path.join(self.get_torrent_folder(), '.solution')
+
+	def _write_solution_cache(self):
+		#
+		# IF none of the involved files mtimes have changed during the search
+		# THEN save a cache of the solution for faster processing next time
+		#
+		solution_cache = []
+		solution_cache.append('#')
+		solution_cache.append('# a cache of the seeding-solution found by torrentsolver')
+		solution_cache.append('#')
+		solution_cache.append(self.content_hash)
+		for f in self.myfiles:
+			q = f.get_fullpath()
+			m = os.path.getmtime(q)
+			if m!=self.data_mtimes[q]:
+				self.get_logger().debug("Cache not written for safety as '{0}' mtime has changed from {1} to {2}.",  q, mtimes[q], m)
+				return
+			qq = dlib.remove_path(self.get_torrent_folder(), q)
+			solution_cache.append(str(int(m))+' '+qq)
+
+		f = self._solution_cache_path()
+		self.get_logger().info("Writing cache so we can skip this next time.")
+		dlib.save_text(f, solution_cache)
+		self.get_logger().debug("Wrote a cache of the solution to '{0}'.", f)
+
+	def _load_solution_cache(self):
+		f = self._solution_cache_path()
+		if not os.path.exists(f): return False
+		t = dlib.load_text(f)
+		t = filter(lambda x: not x.startswith('#'), t)
+		if not t: return False
+		if t.pop(0)!=self.content_hash: return False
+		a = []
+		for z in t:
+			m = re.match(r"^(\d+) (.*)$", z)
+			if m:
+				mtime1, name = m.group(1, 2)
+				mtime1 = int(mtime1)
+				name = os.path.join(self.get_torrent_folder(), name)
+				a.append(name)
+				mtime2 = int(os.path.getmtime(name))
+				if mtime1!=mtime2: return False
+		if len(a)!=len(self.myfiles): return False
+		# still here? then we are good to go!
+		for i, z in enumerate(a):
+			self.myfiles[i].set_fullpath(z)
+		return True
+
+	# ---------------------------------------------------------------------------
+	#
+	# PIECE VALIDATION
+	#
+
+	def _check_piece_is_correct(self, piece):
+		intervals = self._piece_intervals(piece)
+
+		sha1_hasher = hashlib.sha1()
+		result = CheckTorrentResult.OK
+		for interval in intervals:
+			self.get_logger().debug("Hashing {0}.", interval)
+			if not interval.call(lambda data: sha1_hasher.update(data)):
+				self.get_logger().debug("Inaccessible!")
+				result = CheckTorrentResult.INACCESSIBLE 
+				break
+		if result==CheckTorrentResult.OK:
+			got_hash = sha1_hasher.digest()
+			expected_hash = self.info['pieces'][piece*20:piece*20+20]
+			if got_hash!=expected_hash:
+				self.get_logger().debug("Wrong hash!")
+				self.get_logger().trace("Expected hash of {0} but got {1}.", expected_hash.encode('hex'), got_hash.encode('hex'))
+				result = CheckTorrentResult.BAD_CHECKSUM 
+		if result==CheckTorrentResult.OK:
+				self.get_logger().debug("Ok.")
+		return result
+
+	# ---------------------------------------------------------------------------
+	#
+	# TORRENT SOLVING
+	#
+
+	def _ensure_torrent_folder_exists(self):
+		if not os.path.isdir(self.get_torrent_folder()):
+			self.get_logger().error("No matching torrent folder found - expected: '{0}'.", self.get_torrent_folder())
+			raise CannotSolveTorrentException
+
+	def failure_intro(self):
+		#'self.get_logger().error("Failed processing '{0}'.", self.get_torrent_folder())
+		pass
+
+	def _solve_setup(self):
+		self._ensure_torrent_folder_exists()
+
+		self.get_logger().debug("Gathering file lengths.")
+		# a map from file length to a list of file names
+		disk_files_by_size = {}
+		listing = recursive_lister.recursive_lister(self.get_torrent_folder())
+		for file in listing:
+			s = os.path.getsize(file)
+			disk_files_by_size.setdefault(s, []).append(file)
+
+		for s, fs in disk_files_by_size.iteritems():
+			self.get_logger().debug("File size of {0} has {1} options which are '{2}'.", s, len(fs), fs)
+
+		self.data_mtimes = dict([ (i, os.path.getmtime(i)) for i in listing ])
+
+		piece_solvers = []
+
+		last_torrent_file = None
+		next_chaining_map = {}
+		for piece in xrange(self.piece_count):
+
+		
+			intervals = self._piece_intervals(piece)
+			ignore = intervals[0].torrent_file is last_torrent_file
+			if ignore:
+				intervals = copy.copy(intervals)
+				del intervals[0]
+
+			interval_solvers = []
+			for interval in intervals:
+				torrent_file_length = interval.torrent_file.get_length()
+				disk_files_of_the_same_length = disk_files_by_size.get(torrent_file_length)
+				if not disk_files_of_the_same_length:
+					self.failure_intro()
+					self.get_logger().error('No options for a file of length {0}.', torrent_file_length)
+					raise CannotSolveTorrentException
+				interval_solver = IntervalSolver()
+
+				#
+				# do the next file chaining
+				#
+				# the IntervalSolves point to the next one with the same length so
+				# they can set 'options' for that interval to all the disk_files_of_the_same_length
+				# EXCEPT the one they chose.
+				#
+				interval_solver.next = None
+				last_with_same_length = next_chaining_map.get(torrent_file_length)
+				if last_with_same_length:
+					last_with_same_length.next = interval_solver
+				next_chaining_map[torrent_file_length] = interval_solver
+
+				#
+				# if it isn't going to be set by a proceeding interval with the same length
+				# then set it here:
+				#
+				if not last_with_same_length: interval_solver.options = disk_files_of_the_same_length
+
+				#
+				# work out the option count for this interval
+				#
+				# it's just len(disk_files_of_the_same_length) except for the above-mentioned case
+				#
+				c = interval_solver.option_count = last_with_same_length.option_count-1 if last_with_same_length else len(disk_files_of_the_same_length)
+				if not c:
+					self.failure_intro()
+					self.get_logger().error('No options for a file of length {0}.', torrent_file_length)
+					raise CannotSolveTorrentException
+
+				interval_solver.torrent_file = interval.torrent_file
+				interval_solvers.append(interval_solver)
+				last_torrent_file = interval.torrent_file
+				
+			solution_count = 1
+			for interval_solver in interval_solvers:
+				solution_count *= interval_solver.option_count
+
+			piece_solver = PieceSolver(solution_count, interval_solvers)
+			self.get_logger().trace("{0} choice(s) for piece {1}.", piece_solver.count, piece)
+			if piece_solver.count!=1:
+				self.get_logger().debug("Interesting!")
+			
+			piece_solvers.append(piece_solver)
+
+		assert len(piece_solvers) == self.piece_count
+
+		return piece_solvers
+
+	def _find_solution(self, piece_solvers):
+		log = self.get_logger()
+		piece = 0
+		back_outs = 0
+		hashcheck_failures = 0
+
+		while piece!=self.piece_count:
+			log.debug("Piece {0} ...", piece)
+			with log.indenter(DEBUG):
+				log.progress('{0} Solving for piece {1} of {2}.', dlib.generate_progress(piece, self.piece_count, 20), piece, self.piece_count)
+				piece_solver = piece_solvers[piece]
+				c = piece_solver.current
+				if piece_solver.count == c:
+					# back out
+					back_outs += 1
+					log.debug('Piece solutions exhausted ... we must have got something wrong on a previous piece ... back out ...')
+					piece_solver.current = 0
+					piece -= 1
+					if piece<0:
+						self.failure_intro()
+						log.error("Exhausted all possible solutions without finding a perfect match.")
+						raise CannotSolveTorrentException
+				else:
+					log.debug("Testing solution {0} of {1} ...", c+1, piece_solver.count)
+					with log.indenter(DEBUG):
+						for interval_number, interval_solver in enumerate(piece_solver.interval_solvers):
+							assert interval_solver.option_count == len(interval_solver.options)
+							(c, option) = divmod(c, interval_solver.option_count)
+
+							interval_solver.torrent_file.set_fullpath(interval_solver.options[option])
+							n = interval_solver.next
+							if n:
+								log.debug("What if the {0} file in this piece was '{1}'?", dlib.ordinalth(interval_number+1), interval_solver.options[option])
+								n.options = interval_solver.options[0:option] + interval_solver.options[option+1:]
+								for x, y in enumerate(n.options):
+									log.debug("... and not '{1}' (the {0} other candidate).", dlib.ordinalth(x+1), y)
+							else:
+								log.debug("The {0} file in this piece can only be '{1}'.", dlib.ordinalth(interval_number+1), interval_solver.options[option])
+
+						piece_solver.current += 1
+						if self._check_piece_is_correct(piece)==CheckTorrentResult.OK:
+							piece += 1
+						else:
+							hashcheck_failures += 1
+							# logging output happened inside self._check_piece_is_correct()
+							# so no need to write to 'log' here
+							if hashcheck_failures>1000:
+								self.failure_intro()
+								log.error("Got bored after trying 1000 things that all caused hash check failures")
+								raise CannotSolveTorrentException
+
+		log.info("Solved.")
+		if back_outs or hashcheck_failures:
+			log.info("({0} back out(s) and {1} hash check failure(s) in total)", back_outs, hashcheck_failures)
+
+	def solve_torrent(self):
+		assert self.saveas_style==STYLE_IMPROVED
+
+		if self._load_solution_cache():
+			self.get_logger().info("Got solution from cache.")
+			return
+			
+		log = self.get_logger()
+		log.debug("Setting up solver ...")
+		with log.indenter(DEBUG): piece_solvers = self._solve_setup()
+		log.info("Solving ...")
+		with log.indenter(INFO): self._find_solution(piece_solvers)
+		self._write_solution_cache()
+
+
+	def get_raw_info(self):
+		decorating_coder = bencode.Coder(decorate=True)
+		d = decorating_coder.decode_from_string(self.content)
+		for k, v in d[2].iteritems():
+			if k[2]=='info':
+				return self.content[v[0]:v[1]]
+		log = self.get_logger()
+		log.error("Cannot find raw info!")
+		raise CannotSolveTorrentException
+
+	def generate_links(self, use_fast_resume=True, pri=2):
+		log = self.get_logger()
+		log.info("Writing symlinks for seeding to '{0}'.", self._get_basepath())
+		#
+		# the os.symlink is the bit that does the buisness
+		#
+		# the rest of this function is concerned with adding fast-resume data as we copy the torrent into the seeding area
+		# if you use rtorrent it'll pick this up and not need to hash anything
+		# http://libtorrent.rakshasa.no/downloads/rtorrent_fast_resume.pl
+		#
+		# the torrent community in general doesn't like fast-resume in the torrent file
+		# http://lists.ibiblio.org/pipermail/bittorrent/2006-October/001970.html
+		# they worry about all kinds of extensions leaking out on the internets
+		# so this solution, of adding it only for seeding purposes, is probably best
+		#
+		torrent_data = copy.deepcopy(self.root)
+
+		rtorrent_fast_resume_data = {}
+		if use_fast_resume:
+			torrent_data['libtorrent_resume'] = rtorrent_fast_resume_data
+		rtorrent_fast_resume_data['bitfield'] = self.piece_count
+		rtorrent_fast_resume_data['files'] = rtorrent_resume_info = []
+
+		with log.indenter(DEBUG):
+			for src, dest in dlib.jzip(self._dest.myfiles, self.myfiles):
+				src = src.get_fullpath()
+				src = os.path.abspath(src)
+				dest = dest.get_fullpath()
+				log.debug("source      '{0}'.", src)
+				log.debug("destination '{0}'.", dest)
+				
+				dlib.mkdir_minus_p(os.path.dirname(dest))
+				os.symlink(src, dest)
+				mtime = os.path.getmtime(src)
+				rtorrent_resume_info.append( { 'priority': pri, 'mtime': int(mtime) } )
+				# pri: (0=off, 1=low, 2=normal, 3=high)
+
+		raw_info = self.get_raw_info()
+		torrent_data["info"] = bencode.DirectValue(raw_info)
+		dlib.save_file(self.torrent_fullpath, bencoder.encode_to_string(torrent_data))
+		return True
+
+	# ---------------------------------------------------------------------------
+
+	def __init__(self, torrent_fullpath, saveas_style=STYLE_COMMON, destination_torrent=None, logger=None, quiet=False):
+		self.set_logger(logger)
+
+		self._dest = destination_torrent
+		self.content = self._dest.content if self._dest else dlib.load_file(torrent_fullpath)
+		self.content_hash = dlib.sha1hash_of_string(self.content)
+		self.root, messages = bencoder.decode_from_string_with_messages(self.content)
+		if not quiet:
+			for message in messages:
+				logger.warn(message)
+		self.info = self.root['info']
+
+		#torrent_fullpath = os.path.abspath(torrent_fullpath)
+
+		self.torrent_fullpath = torrent_fullpath
+		self.saveas_style = saveas_style
+
+		self.myfiles = self._torrent_files()
+
+		self.total_length = 0
+		for file in self.myfiles:
+			self.total_length += file.get_length()
+		self.piece_length = self.info['piece length']
+		calculated_piece_count = ( self.total_length + self.piece_length - 1 ) // self.piece_length
+		self.piece_count = len(self.info['pieces'])//20
+		if calculated_piece_count != self.piece_count:
+			raise Exception('unexpected piece count')
+
+		self._piece_intervals_cache = None
+
+	def check_torrent_is_correct(self, verbose=False):
+		for piece in xrange(0, self.piece_count):
+			self.get_logger().progress('{0} Testing piece {1} of {2}.', dlib.generate_progress(piece, self.piece_count, 20), piece, self.piece_count)
+			self.get_logger().debug("Testing piece {0} ...", piece)
+			with self.get_logger().indenter(DEBUG):
+				result = self._check_piece_is_correct(piece)
+				if result!=CheckTorrentResult.OK:
+					e = "Unknown error"
+					if result==CheckTorrentResult.INACCESSIBLE: e = "Piece inaccessible"
+					if result==CheckTorrentResult.BAD_CHECKSUM: e = "Bad hash check"
+					self.get_logger().error("{0}: piece {1}.", e, piece)
+					return False
+		self.get_logger().info("Torrent is correct.")
+		return True
+
+
+def process_torrents(search_path, process, logger):
+	#search_path = os.path.abspath(search_path)
+	logger.info("Looking for torrents in '{0}'.", search_path)
+	count = success = 0
+	for f in recursive_lister.recursive_lister(search_path):
+		if re.search(r'\.torrent$', f):
+			logger.buffer_next()
+			logger.info("Processing '{0}' ...", f)
+			with logger.indenter(WARN):
+				count += 1
+				if process(f):
+					success += 1
+			logger.unbuffer()
+	if count and count==success:
+		logger.info("All torrent(s) were processed successfully.")
+	else:
+		logger.info("{0} out of {1} torrent(s) were processed ouccessfully.", success, count)
+	return count==success
+
+def remove_old_folders(logger, dest):
+	try:
+		l = os.listdir(dest)
+	except OSError, e:
+		logger.warn("{0}: '{1}'.", e.strerror, dest)
+		return False
+	for f in l:
+		if re.match(r"^torrent\d{6}$", f):
+			ff = os.path.join(dest, f)
+			dlib.rm_minus_r(ff)
+	return True
+
+def generate(logger, tasks, dest):
+	if not remove_old_folders(logger, dest): return False
+
+	starts = []
+	for pri, src in tasks:
+
+		def p(f):
+			torrent1 = Torrent(f, saveas_style=STYLE_IMPROVED, logger=logger)
+			try:
+				torrent1.solve_torrent()
+
+				torrent_folder_name = "torrent"+str(len(starts)).zfill(6)
+
+				torrent_name_without_ext = torrent_folder_name
+				# better than 'torrent1.get_name()' if the torrent name contains wierd characters
+				# then we cannot encode them in rtorrent-startup.rc
+
+				torrent_name = torrent_name_without_ext+'.torrent'
+				torrent_partial_path = os.path.join(torrent_folder_name, torrent_name)
+				torrent_fullpath = os.path.join(dest, torrent_partial_path)
+				torrent2 = Torrent(torrent_fullpath, destination_torrent=torrent1, logger=logger, quiet=True)
+				torrent2.generate_links(pri=pri)
+				starts.append('load_start='+torrent_partial_path+',d.set_directory='+torrent_folder_name+'/')
+
+			except CannotSolveTorrentException:
+				###logger.error("Failed to solve torrent.")
+				### an error has already been logged
+				return False
+			return True
+
+		ok = process_torrents(src, p, logger)
+
+	#sections = 4
+	#pause = 2
+	sections = 0
+	pause = 0
+
+	lines = []
+	lines.append("#")
+	lines.append("# rtorrent seems to lack a recursive add ... so we add everything here")
+	lines.append("#")
+	lines.append("# following this discussion http://libtorrent.rakshasa.no/ticket/1807 ...")
+	lines.append("max_open_http = 5")
+	lines.append("")
+	if sections and pause:
+		time = 0
+		while starts:
+			starts[0:sections] = []
+			time += pause
+			cmd_group = ';'.join(starts[0:sections])
+			lines.append('schedule = watch'+str(time)+','+str(time)+',0,'+'"'+cmd_group+'"')
+	else:
+		lines = starts
+
+	dlib.save_text(os.path.join(dest, "rtorrent-startup.rc"), lines)
+
+	return ok
+
+
+
+def usage(item):
+	purpose = """
+Purpose
+-------
+
+If you download lots of torrents you get faced with this problem: you either
+keep the horrible names in order to keep seeding or you rename to better
+names at the cost of no longer being able to seed.
+
+That problem is now fixed.
+
+Rename the files then use CMD to build a folder of symlinks from
+which you can seed with any regular torrent client (such as rtorrent or bittornado).
+
+CMD does not need to track the renames as they happen. You can do
+the renaming at any time on any computer with any tool. You could have done
+the renaming already. CMD uses the hashes in the torrent file to
+figure out what the original names must have been.
+
+For example:
+
+Imagine you download Season 6 of Family Guy and it comes out like this:
+
+	Family Guy/
+		Season 06.torrent
+		family_guy_season6/
+			family.guy.604.pdtv.real-lol.avi
+			family.guy.606.pdtv-lol.avi
+			family.guy.s06e01.hr.pdtv.xvid-ctu.avi
+			Family.Guy.S06E02.REAL.HR.PDTV.XviD-CTU.avi
+			family.guy.s06e03.pdtv.xvid-xor.[VTV].avi
+			Family.Guy.S06E05.REPACK.PDTV.XviD-XOR.[TvT].avi
+			family.guy.s06e07.pdtv.xvid-xor.avi
+			family.guy.s06e08.pdtv.xvid-0tv.avi
+			Family.Guy.S06E09.PDTV.XviD-XOR.avi
+			family.guy.s06e10.pdtv.xvid-xor.avi
+			family.guy.s06.special.100th.pdtv-lol.avi
+
+What a mess! Especially as sorting the names doesn't produce episode order.
+Something like:
+
+	Family Guy/
+		Season 06.torrent
+		Season 06/
+			e01.avi
+			e02.avi
+			e03.avi
+			e04.avi
+			e05.avi
+			e06.avi
+			e07.avi
+			e08.avi
+			e09.avi
+			e10.avi
+			sepcial.avi
+
+would be nicer ... but then you could not seed.
+
+You either keep the horrible names to keep seeding.
+Or you rename but then can't seed any more.
+
+Now you can rename the folders *and the files* and still seed using "CMD solve"!
+e.g. "CMD solve Season 06.torrent seed_from_here"
+
+The only caveat presently is that, though original files can have any names,
+they must ALL be present.
+"""
+	usage = """
+Usage
+-----
+
+CMD solve <verbosity> <torrent_names> <seeding_folder>
+	search torrent_names, work out how the files have been renamed
+	and then create a seeding_folder of symlinks for seeding.
+
+	torrent_names are all assumed to be in the 'improved' style.
+	seeding_folder will be in the 'common' style to allow seeding
+	with all common torrent clients. However, "CMD solve" makes a
+	numbered subfolder per torrent to avoid the problems with the
+	common style (try 'CMD help style' for more information).
+
+	torrent_names is mixed list of .torrent files and/or folders.
+	The folders are searched recursively for .torrent files.
+
+CMD check <verbosity> [--style <style>] <torrent_names>
+	just checks <torrent_names> for correctness
+	(style defaults to 'common')
+
+CMD help <topic>
+	where topic is one of:
+		purpose - show help about the purpose of this software.
+		style   - show help about save-as style.
+		usage   - show this message.
+
+
+<verbosity> is:
+	--quiet    : only give output on error
+	--silent   : never give any output
+	--debug    : show copious information for debugging
+	--progress : show progress bar
+
+Exit values are:
+	0	: everything succeeded
+	1	: there were some errors
+	2	: did not understand command line arguments
+"""
+	style = """
+Style
+-----
+
+common:
+	Use the name stored IN the torrent file.
+	This is the common behaviour of most torrent clients.
+	What is bad about this is it is hard or impossible to tell what files and
+	folders come from what .torrent file.
+
+	This means you end up with things like this:
+
+		Greenwing - Season 1.torrent
+		Greenwing - Season 2.torrent
+		GREENWING/
+		GWSeason0002/
+
+	Or worse:
+
+		Greenwing - Season 1.torrent
+		Greenwing - Season 2.torrent
+		greenwing/
+
+	and perhaps the torrents overwrite each other if they both save into the
+	same file.  (e.g. "greenwing/e01.avi")
+
+	This makes organisation (and security) rather difficult.
+
+improved:
+	Use the name OF the torrent file (minus .torrent) to make a folder in
+	which all files from the torrent live.
+	"x.torrent" always saves into "x/".
+
+	What is good about this is it is very easy to see which files come from
+	which torrents. And you can rename the folder as long as you also rename
+	the torrent file.
+
+	This makes it easy to create organisations like:
+
+		Greenwing/
+			Season 01.torrent
+			Season 01/
+			Season 02.torrent
+			Season 02/
+
+	See "CMD solve" for information about renaming files too!
+
+a note for bittornado users:
+'--style common' is what bittornado calls '--saveas_style 2'
+'--style improved' is what bittornado calls '--saveas_style 3'
+"""
+
+	x = args_module.Args.one_of(item, { "usage": usage, "style": style, "purpose": purpose })
+	x = re.sub(r"CMD", os.path.split(sys.argv[0])[1], x)
+	x = re.sub(r"\t", "  ", x)
+	x = x.split('\n')
+	x = map(lambda q: re.sub(r"\s+$", "", q), x)
+	while not x[0]: x.pop(0)
+	while not x[-1]: x.pop()
+	print '\n'.join(x)
+	print
+
+
+def consume_logger_control_option(args, logger):
+	if args.option_is('quiet'):
+		logger.switch_off(INFO)
+	elif args.option_is('silent'):
+		logger.switch_off(TRACE, DEBUG, INFO, WARN, ERROR, FATAL)
+	elif args.option_is('progress'):
+		logger.switch_on(PROGRESS)
+	elif args.option_is('debug'):
+		logger.switch_on(TRACE, DEBUG)
+	else:
+		return False
+	return True
+
+def ex_main():
+	ok = True
+	logger = Logger()
+
+	logger.switch_on(INFO, WARN, ERROR, FATAL)
+	args = args_module.Args()
+
+	action = args.get_str()
+	if action=='help':
+		usage(args.get_str())
+	elif action=='check':
+		saveas_style = STYLE_COMMON
+		while args.on_an_option():
+			if consume_logger_control_option(args, logger):
+				pass
+			elif args.option_is('style'):
+				saveas_style = args.get_one_of({'common': STYLE_COMMON, 'improved': STYLE_IMPROVED})
+			else:
+				args.unknown_option()
+		while args.remaining():
+			search_path = args.get_str()
+			def p(f):
+				torrent = Torrent(f, saveas_style=saveas_style, logger=logger)
+				return torrent.check_torrent_is_correct(verbose=True)
+			if not process_torrents(search_path, p, logger):
+				ok = False
+	elif action=='solve':
+		tasks = []
+		pri = 10
+		while args.remaining()>1:
+			while args.on_an_option():
+				if consume_logger_control_option(args, logger):
+					pass
+				elif args.option_is('rtorrent_priority'):
+					# pri: (0=off, 1=low, 2=normal, 3=high)
+					pri = args.get_one_of([ 'off', 'low', 'normal', 'high'])
+				else:
+					args.unknown_option()
+			else:
+				path = args.get_str()	
+				tasks.append( (pri, path) )
+		if not tasks: args.fail()
+		destination = args.get_str()
+		ok = generate(logger, tasks, destination)
+	else:
+		args.fail()
+	return ok
+
+def main():
+	try:
+		rc = 0 if ex_main() else 1
+	except args_module.BadOptions:
+		usage('usage')
+		rc = 2
+	sys.exit(rc)
+
+
+main()
+
